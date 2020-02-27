@@ -1,6 +1,8 @@
 package com.jamie.android_ros.arcore_ros;
 
 /* OpenGL Imports */
+import android.annotation.SuppressLint;
+import android.content.Context;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import javax.microedition.khronos.egl.EGLConfig;
@@ -9,6 +11,11 @@ import javax.microedition.khronos.opengles.GL10;
 /* Android Imports */
 import android.os.Handler;
 import android.os.Bundle;
+import android.renderscript.Allocation;
+import android.renderscript.Element;
+import android.renderscript.RenderScript;
+import android.renderscript.ScriptIntrinsicYuvToRGB;
+import android.renderscript.Type;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -18,7 +25,9 @@ import android.widget.Toast;
 /* ARCore Imports */
 import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
+import com.google.ar.core.CameraIntrinsics;
 import com.google.ar.core.Frame;
+import com.google.ar.core.PointCloud;
 import com.google.ar.core.Pose;
 import com.google.ar.core.Session;
 import com.google.ar.core.TrackingState;
@@ -30,6 +39,7 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException;
 
 /* Helper Imports */
+import com.jamie.android_ros.arcore_ros.ros.CameraPublisher;
 import com.jamie.android_ros.arcore_ros.ros.GPSPermissionHelper;
 import com.jamie.android_ros.arcore_ros.arcore.BackgroundRenderer;
 import com.jamie.android_ros.arcore_ros.arcore.CameraPermissionHelper;
@@ -50,7 +60,7 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
 
     private boolean mUserRequestedInstall = true;
     private Session mSession = null;
-    SensorPublisher mPublisher = null;
+    SensorPublisher mSensorPublisher = null;
 
     /* UI Elements */
     private GLSurfaceView surfaceView = null;
@@ -58,6 +68,7 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
     TextView mPoseView = null;
 
     Pose deviceToPhysical = null;
+    private CameraPublisher mCameraPublisher;
 
     public MainActivity() {
         super("Odomobile", "Odomobile");
@@ -68,15 +79,23 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
         NodeConfiguration nodeConfiguration = NodeConfiguration.newPublic(getRosHostname());
         nodeConfiguration.setMasterUri(getMasterUri());
 
-        mPublisher = new SensorPublisher(this, n);
+        mSensorPublisher = new SensorPublisher(this, n);
+        mCameraPublisher = new CameraPublisher(n);
 
         //register listeners - camera and other sensors
-        mPublisher.registerListeners(this);
+        mSensorPublisher.registerListeners(this);
 
-        n.execute(mPublisher, nodeConfiguration);
+        n.execute(mSensorPublisher, nodeConfiguration);
+        n.execute(mCameraPublisher, nodeConfiguration);
+
+        // Verify CAMERA_PERMISSION has been granted.
+        if (!CameraPermissionHelper.hasCameraPermission(this)) {
+            CameraPermissionHelper.requestCameraPermission(this);
+        }
     }
 
     void initARCore(){
+
         surfaceView = findViewById(R.id.surfaceView);
         displayRotationHelper = new DisplayRotationHelper(/*context=*/ this);
 
@@ -91,7 +110,7 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
         surfaceView.setRenderer(this);
         surfaceView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
 
-        maybeEnableArButton();
+        enableARButtonIfARAvailable();
     }
 
     @Override
@@ -173,13 +192,30 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
                     //Pose cameraPose = camera.getPose().compose(deviceToPhysical);
                     Pose cameraPose = deviceToPhysical.compose(pose);
                     // Per frame.
-                    this.mPublisher.onOdomChanged(
+                    this.mSensorPublisher.onOdomChanged(
                             cameraPose.getTranslation(),
                             cameraPose.getRotationQuaternion()
                     );
                 }
 
             }
+
+            PointCloud pointCloud = frame.acquirePointCloud();
+//            TODO: Finish implementing publishing RGB and Depth
+//            int[] imageDimensions = frame.getCamera().getImageIntrinsics().getImageDimensions();
+//            int width = imageDimensions[0], height = imageDimensions[1];
+//            Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+//            Image image = frame.acquireCameraImage();
+//            Allocation bmData = renderScriptNV21ToRGBA888(
+//                    this,
+//                    width,
+//                    height,
+//                    frame.acquireCameraImage().);
+//            bmData.copyTo(bitmap);
+
+            CameraIntrinsics cameraInfo = frame.getCamera().getImageIntrinsics();
+
+            mCameraPublisher.update(pointCloud, cameraInfo);
 
             // Draw background.
             backgroundRenderer.draw(frame);
@@ -207,6 +243,23 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
             // Avoid crashing the application due to unhandled exceptions.
             Log.e("draw", "Exception on the OpenGL thread", t);
         }
+    }
+
+    public Allocation renderScriptNV21ToRGBA888(Context context, int width, int height, byte[] nv21) {
+        RenderScript rs = RenderScript.create(context);
+        ScriptIntrinsicYuvToRGB yuvToRgbIntrinsic = ScriptIntrinsicYuvToRGB.create(rs, Element.U8_4(rs));
+
+        Type.Builder yuvType = new Type.Builder(rs, Element.U8(rs)).setX(nv21.length);
+        Allocation in = Allocation.createTyped(rs, yuvType.create(), Allocation.USAGE_SCRIPT);
+
+        Type.Builder rgbaType = new Type.Builder(rs, Element.RGBA_8888(rs)).setX(width).setY(height);
+        Allocation out = Allocation.createTyped(rs, rgbaType.create(), Allocation.USAGE_SCRIPT);
+
+        in.copyFrom(nv21);
+
+        yuvToRgbIntrinsic.setInput(in);
+        yuvToRgbIntrinsic.forEach(out);
+        return out;
     }
 
     @Override
@@ -265,22 +318,20 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
             return;  // mSession is still null.
         }
 
-        if(mSession != null){
-            try {
-                if(CameraPermissionHelper.hasCameraPermission(this)) {
-                    mSession.setCameraTextureName(backgroundRenderer.getTextureId());
-                    mSession.resume();
+        try {
+            if(CameraPermissionHelper.hasCameraPermission(this)) {
+                mSession.setCameraTextureName(backgroundRenderer.getTextureId());
+                mSession.resume();
 
-                    if(surfaceView != null) {
-                        surfaceView.onResume();
-                    }
-                    displayRotationHelper.onResume();
+                if(surfaceView != null) {
+                    surfaceView.onResume();
                 }
-            }catch(CameraNotAvailableException e){
-                Toast.makeText(this, "TODO: handle exception " + e, Toast.LENGTH_LONG)
-                        .show();
-                return;
+                displayRotationHelper.onResume();
             }
+        }catch(CameraNotAvailableException e){
+            Toast.makeText(this, "Camera not available and not handled " + e, Toast.LENGTH_LONG)
+                    .show();
+            return;
         }
 
     }
@@ -309,24 +360,27 @@ public class MainActivity extends RosActivity implements GLSurfaceView.Renderer 
 
     }
 
-    void maybeEnableArButton() {
+    @SuppressLint("SetTextI18n")
+    void enableARButtonIfARAvailable() {
         ArCoreApk.Availability availability = ArCoreApk.getInstance().checkAvailability(this);
         if (availability.isTransient()) {
             // Re-query at 5Hz while compatibility is checked in the background.
             new Handler().postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    maybeEnableArButton();
+                    enableARButtonIfARAvailable();
                 }
             }, 200);
         }
         if (availability.isSupported()) {
             mArButton.setVisibility(View.VISIBLE);
             mArButton.setEnabled(true);
+            mPoseView.setText("AR is enabled and ready");
             // indicator on the button.
         } else { // Unsupported or unknown.
             mArButton.setVisibility(View.INVISIBLE);
             mArButton.setEnabled(false);
+            mPoseView.setText("AR is not available/unsupported");
         }
     }
 
